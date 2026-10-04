@@ -15,7 +15,6 @@ import io.github.proify.lyricon.statusbarlyric.logo.CoverStrategy
 import io.github.proify.lyricon.subscriber.ActivePlayerListener
 import io.github.proify.lyricon.subscriber.ProviderInfo
 import io.github.proify.lyricon.xposed.logger.YLog
-import io.github.proify.lyricon.xposed.systemui.hook.OplusCapsuleHooker
 import io.github.proify.lyricon.xposed.systemui.lyric.StatusBarViewManager.MAIN_LOOPER
 import io.github.proify.lyricon.xposed.systemui.util.NotificationCoverHelper
 import java.io.File
@@ -23,12 +22,11 @@ import java.io.File
 /**
  * 歌词视图核心控制器 (Lyric View Controller)
  * * 负责接收播放器状态、歌曲信息及系统 UI 变更，并将数据分发至所有已注册的状态栏控制器。
- * 实现了 [ActivePlayerListener]、[OplusCapsuleHooker.CapsuleStateChangeListener] 等核心接口。
+ * 实现了 [ActivePlayerListener] 等核心接口；胶囊状态由各状态栏控制器独立订阅。
  * * @author Tomakino
  * @since 2026
  */
 object LyricViewController : ActivePlayerListener,
-    OplusCapsuleHooker.CapsuleStateChangeListener,
     NotificationCoverHelper.OnCoverUpdateListener {
 
     private const val TAG = "LyricViewController"
@@ -62,6 +60,10 @@ object LyricViewController : ActivePlayerListener,
     var currentSong: Song? = null
         private set
 
+    @Volatile private var currentText: String? = null
+    @Volatile private var replaySong: Song? = null
+    @Volatile private var currentProvider: ProviderInfo? = null
+
     /** 用于处理 UI 刷新任务的 Handler */
     private val mainHandler by lazy { Handler(MAIN_LOOPER) }
 
@@ -79,7 +81,6 @@ object LyricViewController : ActivePlayerListener,
         if (DEBUG) YLog.debug(TAG, "Initializing LyricViewController...")
         // 注册数据总线、系统钩子及封面更新监听
         LyricDataHub.addListener(this)
-        OplusCapsuleHooker.registerListener(this)
         NotificationCoverHelper.registerListener(this)
     }
 
@@ -90,6 +91,8 @@ object LyricViewController : ActivePlayerListener,
     override fun onSongChanged(song: Song?) {
         YLog.info(TAG, "onSongChanged: $song")
         this.currentSong = song
+        replaySong = song
+        this.currentText = null
 
         updateAllControllers {
             lyricView.setSong(song)
@@ -121,6 +124,9 @@ object LyricViewController : ActivePlayerListener,
         YLog.info(TAG, "onActiveProviderChanged: $providerInfo")
 
         this.activePackage = providerInfo?.playerPackageName.orEmpty()
+        currentProvider = providerInfo
+        replaySong = null
+        currentText = null
         LyricPrefs.activePackageName = this.activePackage
 
         updateAllControllers {
@@ -165,6 +171,8 @@ object LyricViewController : ActivePlayerListener,
      */
     override fun onReceiveText(text: String?) {
         YLog.info(TAG, "onReceiveText: $text")
+        currentText = text
+        replaySong = null
         updateAllControllers { lyricView.setText(text) }
     }
 
@@ -197,6 +205,30 @@ object LyricViewController : ActivePlayerListener,
     fun applyConfigurationUpdate(style: LyricStyle) {
         updateAllControllers { updateLyricStyle(style) }
         LyricDataHub.reprocessCurrentSong()
+    }
+
+    /** A rebuilt status bar must not wait for the player to send another song event. */
+    fun restorePlayback(controller: StatusBarViewController) {
+        controller.lyricView.apply {
+            logoView.activePackage = activePackage
+            logoView.providerLogo = currentProvider?.logo
+            val song = replaySong
+            if (song != null) setSong(song) else setText(currentText)
+            setPlaying(this@LyricViewController.isPlaying)
+            setPosition(currentLogicPosition)
+            refreshTranslationVisibility(this)
+        }
+        val song = replaySong
+        if (song != null && activePackage.isNotBlank()) {
+            val file = NotificationCoverHelper.getCachedCoverFile(
+                activePackage, song.name.orEmpty(), song.artist.orEmpty()
+            )?.takeIf { it.exists() }
+            controller.lyricView.logoView.apply {
+                coverFile = file
+                (strategy as? CoverStrategy)?.updateContent()
+            }
+            controller.updateCoverThemeColors(file)
+        }
     }
 
     /**
@@ -255,15 +287,6 @@ object LyricViewController : ActivePlayerListener,
                 YLog.error(TAG, "UI Update distribution error", e)
             }
         }
-    }
-
-    /**
-     * Oplus (ColorOS) 胶囊状态变更监听。
-     * 用于在系统胶囊出现时自动隐藏歌词，避免遮挡。
-     * @param isShowing 胶囊是否正在显示
-     */
-    override fun onColorOsCapsuleVisibilityChanged(isShowing: Boolean) {
-        updateAllControllers { lyricView.setOplusCapsuleVisibility(isShowing) }
     }
 
     /**

@@ -26,3 +26,7 @@ docs/.vitepress/dist/
 
 package.json
 package-lock.json
+
+# All new project documentation must stay in local_docs and must never be committed.
+# Never force-add files from this directory or remove this ignore rule.
+/local_docs/

@@ -9,6 +9,7 @@ package io.github.proify.lyricon.xposed.systemui.lyric
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.drawable.GradientDrawable
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -30,6 +31,7 @@ import io.github.proify.lyricon.lyric.style.LyricStyle
 import io.github.proify.lyricon.statusbarlyric.StatusBarLyric
 import io.github.proify.lyricon.xposed.logger.YLog
 import io.github.proify.lyricon.xposed.systemui.hook.ClockViewFinder
+import io.github.proify.lyricon.xposed.systemui.hook.CapsuleDisplayState
 import io.github.proify.lyricon.xposed.systemui.hook.OplusCapsuleHooker
 import io.github.proify.lyricon.xposed.systemui.hook.StatusBarColorMonitor
 import io.github.proify.lyricon.xposed.systemui.lyric.LyricViewController.isPlaying
@@ -64,6 +66,9 @@ class StatusBarViewController(
     private var lastAnchor = ""
     private var lastInsertionOrder = -1
     private var internalRemoveLyricViewFlag = false
+    private var destroyed = false
+    private var capsuleState = CapsuleDisplayState.ABSENT
+    private var lastWidthRecord: String? = null
     private var lastHighlightView: View? = null
     private var colorMonitorView: View? = null
     private var coverColorPaletteResult: ColorPaletteResult? = null
@@ -82,6 +87,8 @@ class StatusBarViewController(
     }
 
     private val onGlobalLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+        OplusCapsuleHooker.refresh(statusBarView)
+        logWidth("layout")
         applyVisibilityRulesNow()
 //        // 无副作用复核:布局事件也是状态栏颜色可能的变更时机(补救观察点)
 //        StatusBarColorMonitor.refresh()
@@ -89,6 +96,13 @@ class StatusBarViewController(
 
     // --- 生命周期与初始化 ---
     fun onCreate() {
+        OplusCapsuleHooker.bind(statusBarView) { state ->
+            capsuleState = state
+            if (!destroyed) {
+                lyricView.setOplusCapsuleVisibility(state == CapsuleDisplayState.EXPANDED)
+                logWidth("state")
+            }
+        }
         statusBarView.addOnAttachStateChangeListener(statusBarAttachListener)
         statusBarView.viewTreeObserver.addOnGlobalLayoutListener(onGlobalLayoutListener)
         lyricView.addOnAttachStateChangeListener(lyricAttachListener)
@@ -105,10 +119,14 @@ class StatusBarViewController(
         StatusBarColorMonitor.addListener(colorChangeListener)
 
         statusBarView.doOnAttach { checkLyricViewExists() }
+        LyricViewController.restorePlayback(this)
         YLog.info(tag = TAG, "Lyric view created for $statusBarView")
     }
 
     fun onDestroy() {
+        destroyed = true
+        OplusCapsuleHooker.unbind(statusBarView)
+        visibilityController.applyVisibilityRules(currentLyricStyle.basicStyle.visibilityRules, false)
         statusBarView.removeOnAttachStateChangeListener(statusBarAttachListener)
         statusBarView.viewTreeObserver.removeOnGlobalLayoutListener(onGlobalLayoutListener)
         lyricView.removeOnAttachStateChangeListener(lyricAttachListener)
@@ -120,6 +138,8 @@ class StatusBarViewController(
         StatusBarColorMonitor.removeListener(colorChangeListener)
         colorMonitorView?.let { StatusBarColorMonitor.unbindClockView(it) }
         colorMonitorView = null
+        internalRemoveLyricViewFlag = true
+        (lyricView.parent as? ViewGroup)?.removeView(lyricView)
         YLog.info(tag = TAG, "Lyric view destroyed for $statusBarView")
     }
 
@@ -178,7 +198,10 @@ class StatusBarViewController(
      * 更新歌词样式及位置，若锚点或顺序变化则重新注入视图
      */
     fun updateLyricStyle(lyricStyle: LyricStyle) {
+        if (destroyed) return
         this.currentLyricStyle = lyricStyle
+        OplusCapsuleHooker.refresh(statusBarView, "configuration")
+        lyricView.setOplusCapsuleVisibility(OplusCapsuleHooker.isExpanded(statusBarView))
         val basicStyle = lyricStyle.basicStyle
 
         val needUpdateLocation = lastAnchor != basicStyle.anchor
@@ -193,6 +216,7 @@ class StatusBarViewController(
             updateLocation(basicStyle)
         }
         lyricView.updateStyle(lyricStyle)
+        logWidth("configuration")
         refreshGestureConfig()
 
         systemStatusBarColor?.let { updateStatusColor(it) }
@@ -240,7 +264,7 @@ class StatusBarViewController(
         val lp = lyricView.layoutParams ?: run {
             val width = baseStyle.getAutoWidth(
                 context.isLandScape(),
-                isOplusCapsuleShowing = OplusCapsuleHooker.isShowing
+                isOplusCapsuleShowing = OplusCapsuleHooker.isExpanded(statusBarView)
             ).dp
 
             ViewGroup.LayoutParams(width, ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -261,6 +285,7 @@ class StatusBarViewController(
     }
 
     fun checkLyricViewExists() {
+        if (destroyed || !statusBarView.isAttachedToWindow) return
         if (lyricView.isAttachedToWindow) return
         lastAnchor = ""
         lastInsertionOrder = -1
@@ -303,7 +328,20 @@ class StatusBarViewController(
     }
 
     private fun createLyricView(style: LyricStyle) =
-        StatusBarLyric(context, style, getClockView() as? TextView)
+        StatusBarLyric(context, style, getClockView() as? TextView).apply {
+            setOplusCapsuleVisibility(OplusCapsuleHooker.isExpanded(statusBarView))
+        }
+
+    private fun logWidth(reason: String) {
+        val target = lyricView.layoutParams?.width
+        val record = "state=$capsuleState anchor=${currentLyricStyle.basicStyle.anchor} " +
+            "target=$target measured=${lyricView.measuredWidth} actual=${lyricView.width} " +
+            "params=${lyricView.layoutParams?.javaClass?.simpleName}"
+        if (record == lastWidthRecord) return
+        lastWidthRecord = record
+        YLog.info(TAG, "owner=${System.identityHashCode(statusBarView)} source=$reason " +
+            "at=${SystemClock.uptimeMillis()} $record")
+    }
 
     // --- 手势控制 ---
 
@@ -401,7 +439,9 @@ class StatusBarViewController(
 
     private val statusBarAttachListener = object : View.OnAttachStateChangeListener {
         override fun onViewAttachedToWindow(v: View) {}
-        override fun onViewDetachedFromWindow(v: View) {}
+        override fun onViewDetachedFromWindow(v: View) {
+            StatusBarViewManager.remove(this@StatusBarViewController)
+        }
     }
 
     override fun onScreenOn() {

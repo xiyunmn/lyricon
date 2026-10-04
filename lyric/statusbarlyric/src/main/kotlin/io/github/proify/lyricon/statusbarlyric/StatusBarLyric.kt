@@ -12,6 +12,7 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.content.res.Configuration
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.GestureDetector
 import android.view.Gravity
@@ -437,8 +438,12 @@ class StatusBarLyric(
     }
 
     fun setOplusCapsuleVisibility(visible: Boolean) {
+        if (Looper.myLooper() != context.mainLooper) {
+            mainHandler.post { setOplusCapsuleVisibility(visible) }
+            return
+        }
+        if (isOplusCapsuleShowing == visible) return
         isOplusCapsuleShowing = visible
-        triggerSingleTransition()
         updateWidthInternal(currentStyle)
         logoView.isOplusCapsuleShowing = visible
     }
@@ -590,10 +595,12 @@ class StatusBarLyric(
 
         ensureLayoutParams().apply {
             width = calculateContainerWidth(basic)
-            leftMargin = margins.left.dp
-            topMargin = margins.top.dp
-            rightMargin = margins.right.dp
-            bottomMargin = margins.bottom.dp
+            if (this is ViewGroup.MarginLayoutParams) {
+                leftMargin = margins.left.dp
+                topMargin = margins.top.dp
+                rightMargin = margins.right.dp
+                bottomMargin = margins.bottom.dp
+            }
         }
         updateTextViewWidthMode()
 
@@ -607,7 +614,9 @@ class StatusBarLyric(
 
     private fun updateWidthInternal(style: LyricStyle) {
         val width = calculateContainerWidth(style.basicStyle)
-        ensureLayoutParams().width = width
+        val params = ensureLayoutParams()
+        if (params.width == width) return
+        params.width = width
         requestLayout()
         Log.d(TAG, "updateWidthInternal: $width")
     }
@@ -625,15 +634,11 @@ class StatusBarLyric(
         textView.layoutParams = lp
     }
 
-    private fun ensureLayoutParams(): LayoutParams {
-        val lp = layoutParams as? LayoutParams
-            ?: LayoutParams(
-                LayoutParams.WRAP_CONTENT,
-                LayoutParams.MATCH_PARENT
-            )
-        if (layoutParams == null) layoutParams = lp
-        return lp
-    }
+    // LayoutParams belong to our parent. A clock anchor lives in FrameLayout on ColorOS.
+    private fun ensureLayoutParams(): ViewGroup.LayoutParams = layoutParams
+        ?: ViewGroup.MarginLayoutParams(
+            LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT
+        ).also { layoutParams = it }
 
     private fun triggerSingleTransition() {
         singleLayoutTransition.enableTransitionType(LayoutTransition.CHANGING)

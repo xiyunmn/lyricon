@@ -7,8 +7,8 @@
 package io.github.proify.lyricon.xposed.systemui
 
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
-import androidx.core.view.doOnAttach
 import io.github.proify.android.extensions.deflate
 import io.github.proify.android.extensions.json
 import io.github.proify.android.extensions.safeEncode
@@ -238,8 +238,9 @@ object SystemUIHooker : PackageHooker() {
      * 将自定义控制器绑定到状态栏视图
      */
     private fun addStatusBarView(view: ViewGroup) {
-        view.doOnAttach {
-            val target = view.rootView as? ViewGroup ?: return@doOnAttach
+        fun attach() {
+            val target = view.rootView as? ViewGroup ?: return
+            if (StatusBarViewManager.controllers.any { it.statusBarView === target }) return
             val controller = StatusBarViewController(target, LyricPrefs.getLyricStyle())
             StatusBarViewManager.add(controller)
 
@@ -248,6 +249,11 @@ object SystemUIHooker : PackageHooker() {
                 if (TEST_CRASH) target.postDelayed({ error("test crash") }, 3000)
             }
         }
+        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) = attach()
+            override fun onViewDetachedFromWindow(v: View) = Unit
+        })
+        if (view.isAttachedToWindow) attach()
     }
 
     /**
